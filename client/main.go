@@ -2309,12 +2309,12 @@ func main() {
 	wg1.Add(1)
 	go func() {
 		defer wg1.Done()
-		oneDtlsConnectionLoop(ctx, peer, listenConn, inboundChan, connchan, okchan, 1)
+		oneDtlsConnectionLoop(ctx, peer, listenConn, inboundChan, connchan, okchan, 0)
 	}()
 	wg1.Add(1)
 	go func() {
 		defer wg1.Done()
-		oneTurnConnectionLoop(ctx, params, peer, connchan, t, 1)
+		oneTurnConnectionLoop(ctx, params, peer, connchan, t, 0)
 	}()
 
 	select {
