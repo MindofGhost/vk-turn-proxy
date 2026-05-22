@@ -1945,10 +1945,25 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	})
 	var internalPipeAddr atomic.Value
 	useWrap := len(turnParams.wrapKey) == wrapKeyLen
+	var wrapTX, wrapRX *wrapConn
+	if useWrap {
+		var wrapErr error
+		wrapTX, wrapErr = newWrapConn(turnParams.wrapKey, false)
+		if wrapErr != nil {
+			log.Printf("[STREAM %d] WRAP init failed: %v", streamID, wrapErr)
+			return
+		}
+		wrapRX, wrapErr = newWrapConn(turnParams.wrapKey, false)
+		if wrapErr != nil {
+			log.Printf("[STREAM %d] UNWRAP init failed: %v", streamID, wrapErr)
+			return
+		}
+	}
 
 	go func() {
 		defer turncancel()
 		buf := make([]byte, 1600)
+		wrapBuf := make([]byte, wrapMaxWire(len(buf)))
 		for {
 			if turnctx.Err() != nil {
 				return
@@ -1965,12 +1980,12 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 
 			out := buf[:n]
 			if useWrap {
-				wrapped, wrapErr := wrapPacket(turnParams.wrapKey, out)
+				m, wrapErr := wrapTX.wrapInto(wrapBuf, out)
 				if wrapErr != nil {
 					log.Printf("[STREAM %d] WRAP failed: %v", streamID, wrapErr)
 					return
 				}
-				out = wrapped
+				out = wrapBuf[:m]
 			}
 
 			written, err1 := relayConn.WriteTo(out, peer)
@@ -1986,7 +2001,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		defer turncancel()
 		readBufLen := 1600
 		if useWrap {
-			readBufLen += wrapNonceLen
+			readBufLen = wrapMaxWire(readBufLen)
 		}
 		buf := make([]byte, readBufLen)
 		plain := make([]byte, 1600)
@@ -2003,7 +2018,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 			if addr, ok := addr1.(net.Addr); ok {
 				payload := buf[:n]
 				if useWrap {
-					m, wrapErr := unwrapPacket(turnParams.wrapKey, payload, plain)
+					m, wrapErr := wrapRX.unwrapPacket(payload, plain)
 					if wrapErr != nil {
 						log.Printf("[STREAM %d] UNWRAP failed: %v (n=%d)", streamID, wrapErr, n)
 						continue
@@ -2148,7 +2163,7 @@ func main() {
 	direct := flag.Bool("no-dtls", false, "connect without obfuscation. DO NOT USE")
 	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
 	vlessBond := flag.Bool("vless-bond", false, "bond one VLESS TCP connection across all active smux sessions")
-	wrapMode := flag.Bool("wrap", false, "WRAP mode: ChaCha20-XOR obfuscate DTLS packets before they reach TURN ChannelData")
+	wrapMode := flag.Bool("wrap", false, "WRAP mode: SRTP-like AEAD obfuscation for DTLS packets before they reach TURN ChannelData")
 	wrapKeyHex := flag.String("wrap-key", "", "32-byte hex-encoded shared key for -wrap (64 hex chars)")
 	genWrapKey := flag.Bool("gen-wrap-key", false, "print a fresh 64-character hex key for -wrap-key and exit")
 	streamsPerCredFlag := flag.Int("streams-per-cred", streamsPerCache, "number of TURN streams sharing one VK credential cache")
@@ -3017,7 +3032,11 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, i
 		cleanup()
 		return nil, nil, fmt.Errorf("generate cert: %w", err)
 	}
-	dtlsPC := &relayPacketConn{relay: relayConn, peer: peer, wrapKey: tp.wrapKey}
+	dtlsPC, err := newRelayPacketConn(relayConn, peer, tp.wrapKey)
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
 	dtlsConn, err := dtls.ClientWithOptions(dtlsPC, peer,
 		dtls.WithCertificates(certificate),
 		dtls.WithInsecureSkipVerify(true),
@@ -3066,22 +3085,41 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, i
 }
 
 // relayPacketConn wraps a TURN relay PacketConn to direct all writes to the peer.
+// When wrapTX/wrapRX are set, packets are wrapped/unwrapped with SRTP-mimicry AEAD.
 type relayPacketConn struct {
-	relay   net.PacketConn
-	peer    net.Addr
-	wrapKey []byte
+	relay  net.PacketConn
+	peer   net.Addr
+	wrapTX *wrapConn
+	wrapRX *wrapConn
+}
+
+func newRelayPacketConn(relay net.PacketConn, peer net.Addr, wrapKey []byte) (*relayPacketConn, error) {
+	r := &relayPacketConn{relay: relay, peer: peer}
+	if len(wrapKey) != wrapKeyLen {
+		return r, nil
+	}
+	var err error
+	r.wrapTX, err = newWrapConn(wrapKey, false)
+	if err != nil {
+		return nil, fmt.Errorf("wrap tx init: %w", err)
+	}
+	r.wrapRX, err = newWrapConn(wrapKey, false)
+	if err != nil {
+		return nil, fmt.Errorf("wrap rx init: %w", err)
+	}
+	return r, nil
 }
 
 func (r *relayPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
-	if len(r.wrapKey) != wrapKeyLen {
+	if r.wrapRX == nil {
 		return r.relay.ReadFrom(b)
 	}
-	buf := make([]byte, len(b)+wrapNonceLen)
+	buf := make([]byte, wrapMaxWire(len(b)))
 	n, addr, err := r.relay.ReadFrom(buf)
 	if err != nil {
 		return 0, addr, err
 	}
-	m, err := unwrapPacket(r.wrapKey, buf[:n], b)
+	m, err := r.wrapRX.unwrapPacket(buf[:n], b)
 	if err != nil {
 		return 0, addr, err
 	}
@@ -3089,14 +3127,15 @@ func (r *relayPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 }
 
 func (r *relayPacketConn) WriteTo(b []byte, _ net.Addr) (int, error) {
-	if len(r.wrapKey) != wrapKeyLen {
+	if r.wrapTX == nil {
 		return r.relay.WriteTo(b, r.peer)
 	}
-	out, err := wrapPacket(r.wrapKey, b)
+	out := make([]byte, wrapMaxWire(len(b)))
+	n, err := r.wrapTX.wrapInto(out, b)
 	if err != nil {
 		return 0, err
 	}
-	if _, err = r.relay.WriteTo(out, r.peer); err != nil {
+	if _, err = r.relay.WriteTo(out[:n], r.peer); err != nil {
 		return 0, err
 	}
 	return len(b), nil

@@ -3,25 +3,62 @@
 package main
 
 import (
+	"crypto/cipher"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	dtlsnet "github.com/pion/dtls/v3/pkg/net"
 	pionudp "github.com/pion/transport/v4/udp"
-	"golang.org/x/crypto/chacha20"
+	"golang.org/x/crypto/chacha20poly1305"
 )
+
+// Wire format is identical to client. Server sets the MSB of sessionID/SSRC;
+// client clears it. RTP header fields are per-conn.
 
 const (
-	wrapNonceLen = 12
-	wrapKeyLen   = 32
+	wrapKeyLen     = 32
+	wrapRTPHdrLen  = 12
+	wrapNonceLen   = 12
+	wrapTagLen     = 16
+	wrapHeaderLen  = wrapRTPHdrLen + wrapNonceLen
+	wrapOverhead   = wrapHeaderLen + wrapTagLen
+	wrapRTPVersion = 0x80
+	wrapRTPPT      = 0x6F
+	wrapTSStep     = 960
 )
 
-func listenWrapped(addr *net.UDPAddr, key []byte) (dtlsnet.PacketListener, error) {
+var bufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 1600+wrapOverhead)
+		return &b
+	},
+}
+
+type wrapState struct {
+	aead cipher.AEAD
+}
+
+func newWrapState(key []byte) (*wrapState, error) {
 	if len(key) != wrapKeyLen {
 		return nil, fmt.Errorf("wrap: key must be %d bytes (got %d)", wrapKeyLen, len(key))
+	}
+	aead, err := chacha20poly1305.New(key)
+	if err != nil {
+		return nil, fmt.Errorf("wrap: aead init: %w", err)
+	}
+	return &wrapState{aead: aead}, nil
+}
+
+func listenWrapped(addr *net.UDPAddr, key []byte) (dtlsnet.PacketListener, error) {
+	ws, err := newWrapState(key)
+	if err != nil {
+		return nil, err
 	}
 	inner, err := pionudp.Listen("udp", addr)
 	if err != nil {
@@ -29,13 +66,13 @@ func listenWrapped(addr *net.UDPAddr, key []byte) (dtlsnet.PacketListener, error
 	}
 	return &wrapPacketListener{
 		inner: dtlsnet.PacketListenerFromListener(inner),
-		key:   key,
+		ws:    ws,
 	}, nil
 }
 
 type wrapPacketListener struct {
 	inner dtlsnet.PacketListener
-	key   []byte
+	ws    *wrapState
 }
 
 func (l *wrapPacketListener) Accept() (net.PacketConn, net.Addr, error) {
@@ -43,49 +80,104 @@ func (l *wrapPacketListener) Accept() (net.PacketConn, net.Addr, error) {
 	if err != nil {
 		return pc, addr, err
 	}
-	return &wrapPacketConn{inner: pc, key: l.key}, addr, nil
+	c := &wrapPacketConn{inner: pc, ws: l.ws}
+
+	var rnd [16]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		return nil, addr, fmt.Errorf("wrap: rand init: %w", err)
+	}
+	copy(c.sessionID[:], rnd[0:4])
+	copy(c.ssrc[:], rnd[4:8])
+	c.sessionID[0] |= 0x80
+	c.ssrc[0] |= 0x80
+	c.seq.Store(uint32(binary.BigEndian.Uint16(rnd[8:10])))
+	c.timestamp.Store(binary.BigEndian.Uint32(rnd[10:14]))
+
+	var cb [8]byte
+	if _, err := rand.Read(cb[:]); err != nil {
+		return nil, addr, fmt.Errorf("wrap: counter rand: %w", err)
+	}
+	c.counter.Store(binary.BigEndian.Uint64(cb[:]))
+	return c, addr, nil
 }
 
 func (l *wrapPacketListener) Close() error   { return l.inner.Close() }
 func (l *wrapPacketListener) Addr() net.Addr { return l.inner.Addr() }
 
 type wrapPacketConn struct {
-	inner net.PacketConn
-	key   []byte
+	inner     net.PacketConn
+	ws        *wrapState
+	sessionID [4]byte
+	ssrc      [4]byte
+	counter   atomic.Uint64
+	seq       atomic.Uint32
+	timestamp atomic.Uint32
 }
 
 func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	buf := make([]byte, len(p)+wrapNonceLen)
-	n, addr, err := c.inner.ReadFrom(buf)
+	bp := bufPool.Get().(*[]byte)
+	buf := *bp
+	need := len(p) + wrapOverhead
+	if cap(buf) < need {
+		buf = make([]byte, need)
+		*bp = buf
+	}
+	defer bufPool.Put(bp)
+
+	n, addr, err := c.inner.ReadFrom(buf[:cap(buf)])
 	if err != nil {
 		return 0, addr, err
 	}
-	if n < wrapNonceLen {
-		return 0, addr, errors.New("wrap: short packet (no nonce)")
+	wire := buf[:n]
+	if len(wire) < wrapOverhead {
+		return 0, addr, errors.New("wrap: packet too short")
 	}
-	nonce := buf[:wrapNonceLen]
-	ciphertext := buf[wrapNonceLen:n]
-	if len(ciphertext) > len(p) {
-		return 0, addr, errors.New("wrap: read buffer too small")
-	}
-	cipher, err := chacha20.NewUnauthenticatedCipher(c.key, nonce)
+	nonce := wire[wrapRTPHdrLen : wrapRTPHdrLen+wrapNonceLen]
+	aad := wire[:wrapHeaderLen]
+	ct := wire[wrapHeaderLen:]
+
+	plain, err := c.ws.aead.Open(ct[:0], nonce, ct, aad)
 	if err != nil {
-		return 0, addr, fmt.Errorf("wrap: cipher init: %w", err)
+		return 0, addr, fmt.Errorf("wrap: AEAD open: %w", err)
 	}
-	cipher.XORKeyStream(p[:len(ciphertext)], ciphertext)
-	return len(ciphertext), addr, nil
+	if len(plain) > len(p) {
+		return 0, addr, errors.New("wrap: dst buffer too small")
+	}
+	copy(p[:len(plain)], plain)
+	return len(plain), addr, nil
 }
 
 func (c *wrapPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	out := make([]byte, wrapNonceLen+len(p))
-	if _, err := rand.Read(out[:wrapNonceLen]); err != nil {
-		return 0, fmt.Errorf("wrap: nonce gen: %w", err)
+	wireLen := wrapOverhead + len(p)
+
+	bp := bufPool.Get().(*[]byte)
+	out := *bp
+	if cap(out) < wireLen {
+		out = make([]byte, wireLen)
+		*bp = out
 	}
-	cipher, err := chacha20.NewUnauthenticatedCipher(c.key, out[:wrapNonceLen])
-	if err != nil {
-		return 0, fmt.Errorf("wrap: cipher init: %w", err)
-	}
-	cipher.XORKeyStream(out[wrapNonceLen:], p)
+	out = out[:wireLen]
+	defer bufPool.Put(bp)
+
+	out[0] = wrapRTPVersion
+	out[1] = wrapRTPPT
+	seq := uint16(c.seq.Add(1) - 1)
+	binary.BigEndian.PutUint16(out[2:4], seq)
+	ts := c.timestamp.Add(wrapTSStep) - wrapTSStep
+	binary.BigEndian.PutUint32(out[4:8], ts)
+	copy(out[8:12], c.ssrc[:])
+
+	noncePos := wrapRTPHdrLen
+	copy(out[noncePos:noncePos+4], c.sessionID[:])
+	ctr := c.counter.Add(1) - 1
+	binary.BigEndian.PutUint64(out[noncePos+4:noncePos+wrapNonceLen], ctr)
+
+	nonce := out[noncePos : noncePos+wrapNonceLen]
+	aad := out[:wrapHeaderLen]
+	ctPos := wrapHeaderLen
+	copy(out[ctPos:], p)
+	c.ws.aead.Seal(out[ctPos:ctPos], nonce, out[ctPos:ctPos+len(p)], aad)
+
 	if _, err := c.inner.WriteTo(out, addr); err != nil {
 		return 0, err
 	}
