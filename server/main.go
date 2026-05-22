@@ -110,7 +110,11 @@ func main() {
 		}
 		listener, err = dtls.NewListenerWithOptions(wrapListener, dtlsOpts...)
 	} else {
-		listener, err = dtls.ListenWithOptions("udp", addr, dtlsOpts...)
+		udpListener, lerr := listenUDPForDTLS(addr)
+		if lerr != nil {
+			panic(lerr)
+		}
+		listener, err = dtls.NewListenerWithOptions(udpListener, dtlsOpts...)
 	}
 	if err != nil {
 		panic(err)

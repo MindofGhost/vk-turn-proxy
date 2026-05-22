@@ -14,7 +14,6 @@ import (
 	"time"
 
 	dtlsnet "github.com/pion/dtls/v3/pkg/net"
-	pionudp "github.com/pion/transport/v4/udp"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
@@ -60,12 +59,12 @@ func listenWrapped(addr *net.UDPAddr, key []byte) (dtlsnet.PacketListener, error
 	if err != nil {
 		return nil, err
 	}
-	inner, err := pionudp.Listen("udp", addr)
+	innerConn, err := listenPacketInfoUDP("udp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("wrap: udp listen: %w", err)
 	}
 	return &wrapPacketListener{
-		inner: dtlsnet.PacketListenerFromListener(inner),
+		inner: newUDPPacketListener(innerConn, nil),
 		ws:    ws,
 	}, nil
 }
