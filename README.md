@@ -387,6 +387,7 @@ Server:
 - https://github.com/jaykaiperson/lionheart - похожий подход для `stream.wb.ru`.
 - https://github.com/kulikov0/whitelist-bypass - проброс через медиасерверы.
 - https://github.com/NedgNDG/vk-proxy-auto-installer - автоустановщик VK TURN Proxy.
+- https://github.com/defin85/vk-turn-proxy-go
 
 Android:
 
@@ -400,6 +401,8 @@ Android:
 iOS:
 
 - https://github.com/nullcstring/turnbridge
+- https://github.com/iamdiviem/turnbridge
+- https://github.com/anton48/vk-turn-proxy-ios
 
 macOS:
 
