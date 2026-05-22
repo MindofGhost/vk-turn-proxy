@@ -114,7 +114,10 @@ type wrapPacketConn struct {
 }
 
 func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	bp := bufPool.Get().(*[]byte)
+	bp, ok := bufPool.Get().(*[]byte)
+	if !ok {
+		return 0, nil, errors.New("wrap: buffer pool returned invalid type")
+	}
 	buf := *bp
 	need := len(p) + wrapOverhead
 	if cap(buf) < need {
@@ -149,7 +152,10 @@ func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 func (c *wrapPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	wireLen := wrapOverhead + len(p)
 
-	bp := bufPool.Get().(*[]byte)
+	bp, ok := bufPool.Get().(*[]byte)
+	if !ok {
+		return 0, errors.New("wrap: buffer pool returned invalid type")
+	}
 	out := *bp
 	if cap(out) < wireLen {
 		out = make([]byte, wireLen)
