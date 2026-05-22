@@ -170,7 +170,7 @@ func TestUnwrapRejectsTamperedPacket(t *testing.T) {
 	wire[wrapHeaderLen+1] ^= 0xFF
 
 	dst := make([]byte, 1600)
-	if _, err := server.unwrapPacket(wire, dst); err == nil {
+	if _, unwrapErr := server.unwrapPacket(wire, dst); unwrapErr == nil {
 		t.Fatalf("unwrapPacket accepted tampered ciphertext")
 	}
 
@@ -180,7 +180,7 @@ func TestUnwrapRejectsTamperedPacket(t *testing.T) {
 	}
 	wire = wire[:n]
 	wire[8] ^= 0x01
-	if _, err := server.unwrapPacket(wire, dst); err == nil {
+	if _, unwrapErr := server.unwrapPacket(wire, dst); unwrapErr == nil {
 		t.Fatalf("unwrapPacket accepted tampered AAD")
 	}
 }

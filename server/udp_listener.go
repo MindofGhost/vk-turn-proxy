@@ -134,7 +134,9 @@ func (l *udpPacketListener) readLoop() {
 func (l *udpPacketListener) dispatchMsg(raddr net.Addr, buf []byte) {
 	conn, ok := l.getConn(raddr, buf)
 	if ok {
-		_, _ = conn.buffer.Write(buf)
+		if _, err := conn.buffer.Write(buf); err != nil {
+			debugf("udp listener buffer write failed: %v", err)
+		}
 	}
 }
 

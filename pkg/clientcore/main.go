@@ -1930,6 +1930,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	turnctx, turncancel := context.WithCancel(ctx)
+	defer turncancel()
 	stats := &throughputStats{}
 	go stats.logEvery(turnctx, fmt.Sprintf("[STREAM %d] TURN", streamID), "to-turn", "from-turn")
 
@@ -2201,8 +2202,8 @@ func Run(ctx context.Context, cfg Config) error {
 	if captchaSolverVersion != "v1" && captchaSolverVersion != "v2" {
 		captchaSolverVersion = "v2"
 	}
-	if err := setLocalCaptchaHost(cfg.CaptchaHost); err != nil {
-		return err
+	if captchaHostErr := setLocalCaptchaHost(cfg.CaptchaHost); captchaHostErr != nil {
+		return captchaHostErr
 	}
 	autoCaptchaSliderPOC = !manualCaptcha
 
