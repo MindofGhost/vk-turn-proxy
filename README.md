@@ -318,6 +318,7 @@ docker build -t vk-turn-proxy .
 | `-wrap-key` | пусто | 32-байтный ключ в hex, 64 символа |
 | `-gen-wrap-key` | `false` | напечатать новый WRAP-ключ и выйти |
 | `-manual-captcha` | `false` | сразу использовать ручное прохождение captcha |
+| `-captcha-host` | пусто | host:port для manual captcha, например `192.168.99.1:8765` |
 | `-captcha-solver` | `v2` | авто-решатель captcha: `v1` или `v2` |
 | `-streams-per-cred` | `10` | сколько потоков используют один кеш TURN-учетных данных |
 | `-debug` | `false` | подробные логи |

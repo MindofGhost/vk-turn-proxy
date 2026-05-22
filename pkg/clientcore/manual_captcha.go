@@ -24,28 +24,79 @@ import (
 
 const captchaListenPort = "8765"
 
+var customCaptchaHost string
+
 type browserCommand struct {
 	name string
 	args []string
 }
 
+func setLocalCaptchaHost(host string) error {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		customCaptchaHost = ""
+		return nil
+	}
+	if strings.Contains(host, "://") {
+		return fmt.Errorf("-captcha-host must be host:port without scheme")
+	}
+	hostname, port, err := net.SplitHostPort(host)
+	if err != nil {
+		return fmt.Errorf("-captcha-host must be host:port: %w", err)
+	}
+	if hostname == "" || port == "" {
+		return fmt.Errorf("-captcha-host must include both host and port")
+	}
+
+	u := &neturl.URL{Scheme: "http", Host: host}
+	if u.String() == "" {
+		return fmt.Errorf("-captcha-host is invalid")
+	}
+	customCaptchaHost = host
+	return nil
+}
+
+func localCaptchaHost() string {
+	if customCaptchaHost != "" {
+		return customCaptchaHost
+	}
+	return "localhost:" + captchaListenPort
+}
+
 func localCaptchaOrigin() string {
-	return "http://localhost:" + captchaListenPort
+	return (&neturl.URL{Scheme: "http", Host: localCaptchaHost()}).String()
 }
 
 func localCaptchaListenAddrs() []string {
-	return []string{
+	addrs := []string{
 		"127.0.0.1:" + captchaListenPort,
 		"[::1]:" + captchaListenPort,
 	}
+	if customCaptchaHost != "" {
+		addrs = appendUniqueFold(addrs, customCaptchaHost)
+	}
+	return addrs
 }
 
 func localCaptchaHosts() []string {
-	return []string{
+	hosts := []string{
 		"localhost:" + captchaListenPort,
 		"127.0.0.1:" + captchaListenPort,
 		"[::1]:" + captchaListenPort,
 	}
+	if customCaptchaHost != "" {
+		hosts = appendUniqueFold(hosts, customCaptchaHost)
+	}
+	return hosts
+}
+
+func appendUniqueFold(values []string, value string) []string {
+	for _, existing := range values {
+		if strings.EqualFold(existing, value) {
+			return values
+		}
+	}
+	return append(values, value)
 }
 
 func isLocalCaptchaHost(host string) bool {
@@ -60,7 +111,7 @@ func isLocalCaptchaHost(host string) bool {
 func localCaptchaURLForTarget(targetURL *neturl.URL) string {
 	localURL := &neturl.URL{
 		Scheme:   "http",
-		Host:     "localhost:" + captchaListenPort,
+		Host:     localCaptchaHost(),
 		Path:     targetURL.Path,
 		RawPath:  targetURL.RawPath,
 		RawQuery: targetURL.RawQuery,
@@ -484,12 +535,16 @@ func newCaptchaProxyTransport(dialer *dnsdialer.Dialer) *http.Transport {
 
 func startCaptchaServer(srv *http.Server, logPrefix string) error {
 	var listenErrs []string
+	var customListenErr string
 	var listening bool
 
 	for _, addr := range localCaptchaListenAddrs() {
 		listener, err := net.Listen("tcp", addr)
 		if err != nil {
 			listenErrs = append(listenErrs, fmt.Sprintf("%s (%v)", addr, err))
+			if customCaptchaHost != "" && strings.EqualFold(addr, customCaptchaHost) {
+				customListenErr = fmt.Sprintf("%s (%v)", addr, err)
+			}
 			continue
 		}
 		listening = true
@@ -503,6 +558,10 @@ func startCaptchaServer(srv *http.Server, logPrefix string) error {
 				log.Printf("%s: %s", logPrefix, err)
 			}
 		}(wrappedListener)
+	}
+
+	if customListenErr != "" {
+		return fmt.Errorf("captcha listener failed: %s", customListenErr)
 	}
 
 	if listening {

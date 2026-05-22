@@ -2148,6 +2148,7 @@ type Config struct {
 	Debug          bool   `json:"debug,omitempty"`
 	ManualCaptcha  bool   `json:"manual_captcha,omitempty"`
 	CaptchaSolver  string `json:"captcha_solver,omitempty"`
+	CaptchaHost    string `json:"captcha_host,omitempty"`
 }
 
 func (cfg *Config) setDefaults() {
@@ -2199,6 +2200,9 @@ func Run(ctx context.Context, cfg Config) error {
 	captchaSolverVersion = strings.ToLower(strings.TrimSpace(cfg.CaptchaSolver))
 	if captchaSolverVersion != "v1" && captchaSolverVersion != "v2" {
 		captchaSolverVersion = "v2"
+	}
+	if err := setLocalCaptchaHost(cfg.CaptchaHost); err != nil {
+		return err
 	}
 	autoCaptchaSliderPOC = !manualCaptcha
 
