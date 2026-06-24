@@ -17,7 +17,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cacggghp/vk-turn-proxy/tcputil"
+	"cfa/native/vkturn/tcputil"
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 	"github.com/xtaci/smux"
