@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-package clientcore
+package vkturn
 
 import (
 	"crypto/cipher"

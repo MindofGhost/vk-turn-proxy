@@ -1,4 +1,4 @@
-package clientcore
+package vkturn
 
 import (
 	"bytes"
@@ -18,8 +18,6 @@ import (
 	"runtime"
 	"strings"
 	"time"
-
-	"github.com/bschaatsbergen/dnsdialer"
 )
 
 const captchaListenPort = "8765"
@@ -518,7 +516,7 @@ func rewriteCaptchaHTML(html string, targetURL *neturl.URL) string {
 	}
 }
 
-func newCaptchaProxyTransport(dialer *dnsdialer.Dialer) *http.Transport {
+func newCaptchaProxyTransport() *http.Transport {
 	transport := &http.Transport{
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   100,
@@ -527,9 +525,9 @@ func newCaptchaProxyTransport(dialer *dnsdialer.Dialer) *http.Transport {
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     false,
 	}
-	if dialer != nil {
-		transport.DialContext = dialer.DialContext
-	}
+	protectedDialer := getCustomNetDialer()
+	transport.DialContext = protectedDialer.DialContext
+
 	return transport
 }
 
@@ -571,25 +569,34 @@ func startCaptchaServer(srv *http.Server, logPrefix string) error {
 	return fmt.Errorf("captcha listeners failed: %s", strings.Join(listenErrs, "; "))
 }
 
-// runCaptchaServerAndWait triggers the browser, and waiting gracefully for the solution token.
-func runCaptchaServerAndWait(handler http.Handler, captchaURL string, keyCh <-chan string, logPrefix string) (string, error) {
+// runCaptchaServerAndWait triggers the browser and waits for a solution token.
+// The context is intentionally separate from short auth request timeouts, but
+// it must still be cancelled when the TURN client stops so local captcha
+// listeners do not survive service restarts.
+func runCaptchaServerAndWait(ctx context.Context, handler http.Handler, captchaURL string, keyCh <-chan string, logPrefix string) (string, error) {
 	srv := &http.Server{Handler: handler}
 
 	if err := startCaptchaServer(srv, logPrefix); err != nil {
 		return "", err
 	}
+	defer func() {
+		_ = srv.Close()
+	}()
 
-	fmt.Println("\n==============================================")
-	fmt.Println("ACTION REQUIRED: MANUAL CAPTCHA SOLVING NEEDED")
-	fmt.Println("If your browser didn't open automatically,")
-	fmt.Println("manually open this URL: " + localCaptchaOrigin())
-	fmt.Println("==============================================")
-	fmt.Println()
+	log.Println("ACTION REQUIRED: MANUAL CAPTCHA SOLVING NEEDED")
+	log.Println("If your browser didn't open automatically,")
+	log.Println("CAPTCHA_URL: " + localCaptchaOrigin())
+	log.Println("manually open this URL: " + localCaptchaOrigin())
 
 	log.Printf("[%s] Opening browser...", logPrefix)
 	openBrowser(captchaURL)
 
-	key := <-keyCh
+	var key string
+	select {
+	case key = <-keyCh:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 
 	// Best-effort shutdown: the token is already received, so even if
 	// Shutdown times out (e.g. because ishConn.SetDeadline is a no-op
@@ -614,7 +621,7 @@ func notifyKey(keyCh chan<- string, key string) {
 	}
 }
 
-func solveCaptchaViaHTTP(captchaImg string) (string, error) {
+func solveCaptchaViaHTTP(ctx context.Context, captchaImg string) (string, error) {
 	keyCh := make(chan string, 1)
 	mux := http.NewServeMux()
 
@@ -642,7 +649,7 @@ button{font-size:24px;padding:12px 32px;margin-top:12px;cursor:pointer}</style>
 		_, _ = fmt.Fprint(w, `<!DOCTYPE html><html><body><h2>Done!</h2></body></html>`)
 	})
 
-	return runCaptchaServerAndWait(mux, localCaptchaOrigin(), keyCh, "captcha HTTP server error")
+	return runCaptchaServerAndWait(ctx, mux, localCaptchaOrigin(), keyCh, "captcha HTTP server error")
 }
 
 type loggingTransport struct {
@@ -698,7 +705,7 @@ func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	return t.rt.RoundTrip(req)
 }
 
-func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string, error) {
+func solveCaptchaViaProxy(ctx context.Context, redirectURI string) (string, error) {
 	keyCh := make(chan string, 1)
 
 	targetURL, err := neturl.Parse(redirectURI)
@@ -706,7 +713,7 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string,
 		return "", fmt.Errorf("invalid redirect URI: %v", err)
 	}
 
-	transport := &loggingTransport{rt: newCaptchaProxyTransport(dialer)}
+	transport := &loggingTransport{rt: newCaptchaProxyTransport()}
 
 	proxy := &httputil.ReverseProxy{
 		Transport: transport,
@@ -878,7 +885,7 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string,
 		proxy.ServeHTTP(w, r)
 	})
 
-	return runCaptchaServerAndWait(mux, localCaptchaURLForTarget(targetURL), keyCh, "proxy HTTP server error")
+	return runCaptchaServerAndWait(ctx, mux, localCaptchaURLForTarget(targetURL), keyCh, "proxy HTTP server error")
 }
 
 func openBrowser(url string) {

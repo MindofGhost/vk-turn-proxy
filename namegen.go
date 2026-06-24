@@ -1,4 +1,4 @@
-package clientcore
+package vkturn
 
 import (
 	"fmt"
