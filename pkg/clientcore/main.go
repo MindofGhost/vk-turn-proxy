@@ -526,18 +526,11 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 		// try numeric
 		if sidNum, ok2 := errData["captcha_sid"].(float64); ok2 {
 			captchaSid = fmt.Sprintf("%.0f", sidNum)
-		} else {
-			log.Printf("missing captcha_sid in captcha error data")
-			return nil
 		}
 	}
 
 	// Extract captcha_img
-	captchaImg, ok := errData["captcha_img"].(string)
-	if !ok {
-		log.Printf("missing captcha_img in captcha error data")
-		return nil
-	}
+	captchaImg, _ := errData["captcha_img"].(string)
 
 	// Extract error_msg
 	errorMsg, ok := errData["error_msg"].(string)
@@ -1362,7 +1355,10 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 					captchaErr.CaptchaAttempt = "1"
 				}
 
-				if captchaKey != "" {
+				if captchaErr.CaptchaSid == "" {
+					data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&success_token=%s&access_token=%s",
+						link, escapedName, neturl.QueryEscape(successToken), token1)
+				} else if captchaKey != "" {
 					data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&captcha_key=%s&captcha_sid=%s&access_token=%s",
 						link, escapedName, neturl.QueryEscape(captchaKey), captchaErr.CaptchaSid, token1)
 				} else {
