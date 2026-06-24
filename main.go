@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2023 The Pion community <https://pion.ly>
 // SPDX-License-Identifier: MIT
 
-package clientcore
+package vkturn
 
 import (
 	"bytes"
@@ -24,14 +24,16 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
+
+	"cfa/native/app"
+	"cfa/native/vkturn/tcputil"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
 
-	"github.com/bschaatsbergen/dnsdialer"
-	"github.com/cacggghp/vk-turn-proxy/tcputil"
 	"github.com/cbeuw/connutil"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -60,6 +62,7 @@ var (
 	activeLocalPeer      atomic.Value
 	globalCaptchaLockout atomic.Int64
 	connectedStreams     atomic.Int32
+	globalAppContext     context.Context
 	globalAppCancel      context.CancelFunc
 	handshakeSem         = make(chan struct{}, 3)
 	isDebug              bool
@@ -230,6 +233,58 @@ func newDirectNet() transport.Net {
 	return directNet{}
 }
 
+func protectRawConn(conn syscall.RawConn) error {
+	var controlErr error
+	if err := conn.Control(func(fd uintptr) {
+		app.MarkSocket(int(fd))
+	}); err != nil {
+		controlErr = err
+	}
+
+	return controlErr
+}
+
+func protectDialer(dialer *net.Dialer) {
+	previous := dialer.Control
+	dialer.Control = func(network, address string, conn syscall.RawConn) error {
+		if err := protectRawConn(conn); err != nil {
+			return err
+		}
+		if previous != nil {
+			return previous(network, address, conn)
+		}
+		return nil
+	}
+}
+
+func newProtectedDialer() net.Dialer {
+	dialer := net.Dialer{
+		Timeout:   20 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	protectDialer(&dialer)
+
+	return dialer
+}
+
+func protectedDialUDP(ctx context.Context, network string, laddr, raddr *net.UDPAddr) (*net.UDPConn, error) {
+	dialer := newProtectedDialer()
+	dialer.LocalAddr = laddr
+
+	conn, err := dialer.DialContext(ctx, network, raddr.String())
+	if err != nil {
+		return nil, err
+	}
+
+	udpConn, ok := conn.(*net.UDPConn)
+	if !ok {
+		conn.Close()
+		return nil, fmt.Errorf("unexpected UDP conn type %T", conn)
+	}
+
+	return udpConn, nil
+}
+
 func (directNet) ListenPacket(network string, address string) (net.PacketConn, error) {
 	return net.ListenPacket(network, address)
 }
@@ -248,15 +303,30 @@ func (directNet) ListenTCP(network string, laddr *net.TCPAddr) (transport.TCPLis
 }
 
 func (directNet) Dial(network, address string) (net.Conn, error) {
-	return net.Dial(network, address)
+	dialer := newProtectedDialer()
+	return dialer.Dial(network, address)
 }
 
 func (directNet) DialUDP(network string, laddr, raddr *net.UDPAddr) (transport.UDPConn, error) {
-	return net.DialUDP(network, laddr, raddr)
+	return protectedDialUDP(context.Background(), network, laddr, raddr)
 }
 
 func (directNet) DialTCP(network string, laddr, raddr *net.TCPAddr) (transport.TCPConn, error) {
-	return net.DialTCP(network, laddr, raddr)
+	dialer := newProtectedDialer()
+	dialer.LocalAddr = laddr
+
+	conn, err := dialer.DialContext(context.Background(), network, raddr.String())
+	if err != nil {
+		return nil, err
+	}
+
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		conn.Close()
+		return nil, fmt.Errorf("unexpected TCP conn type %T", conn)
+	}
+
+	return tcpConn, nil
 }
 
 func (directNet) ResolveIPAddr(network, address string) (*net.IPAddr, error) {
@@ -397,26 +467,25 @@ func generateCheckboxCursor() string {
 */
 
 func getCustomNetDialer() net.Dialer {
-	return net.Dialer{
-		Timeout:   20 * time.Second,
-		KeepAlive: 30 * time.Second,
-		Resolver: &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				var d net.Dialer
-				dnsServers := []string{"77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"}
-				var lastErr error
-				for _, dns := range dnsServers {
-					conn, err := d.DialContext(ctx, "udp", dns)
-					if err == nil {
-						return conn, nil
-					}
-					lastErr = err
+	dialer := newProtectedDialer()
+	dialer.Resolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := newProtectedDialer()
+			dnsServers := []string{"77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"}
+			var lastErr error
+			for _, dns := range dnsServers {
+				conn, err := d.DialContext(ctx, "udp", dns)
+				if err == nil {
+					return conn, nil
 				}
-				return nil, lastErr
-			},
+				lastErr = err
+			}
+			return nil, lastErr
 		},
 	}
+
+	return dialer
 }
 
 // endregion
@@ -954,7 +1023,7 @@ func (c *StreamCredentialsCache) invalidate(streamID int) {
 	log.Printf("[STREAM %d] [VK Auth] Credentials cache invalidated", streamID)
 }
 
-func getVkCredsCached(ctx context.Context, link string, streamID int, dialer *dnsdialer.Dialer) (string, string, string, error) {
+func getVkCredsCached(ctx context.Context, link string, streamID int) (string, string, string, error) {
 	cache := getStreamCache(streamID)
 	cacheID := getCacheID(streamID)
 
@@ -980,7 +1049,7 @@ func getVkCredsCached(ctx context.Context, link string, streamID int, dialer *dn
 		return cache.creds.Username, cache.creds.Password, addr, nil
 	}
 
-	user, pass, addrs, err := fetchVkCredsSerialized(ctx, link, streamID, dialer)
+	user, pass, addrs, err := fetchVkCredsSerialized(ctx, link, streamID)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -995,7 +1064,7 @@ var (
 	globalLastVkFetchTime time.Time
 )
 
-func fetchVkCredsSerialized(ctx context.Context, link string, streamID int, dialer *dnsdialer.Dialer) (string, string, []string, error) {
+func fetchVkCredsSerialized(ctx context.Context, link string, streamID int) (string, string, []string, error) {
 	vkRequestMu.Lock()
 	defer vkRequestMu.Unlock()
 
@@ -1017,10 +1086,10 @@ func fetchVkCredsSerialized(ctx context.Context, link string, streamID int, dial
 		globalLastVkFetchTime = time.Now()
 	}()
 
-	return fetchVkCreds(ctx, link, streamID, dialer)
+	return fetchVkCreds(ctx, link, streamID)
 }
 
-func fetchVkCreds(ctx context.Context, link string, streamID int, dialer *dnsdialer.Dialer) (string, string, []string, error) {
+func fetchVkCreds(ctx context.Context, link string, streamID int) (string, string, []string, error) {
 	// Check Global Lockout to prevent API bans
 	if time.Now().Unix() < globalCaptchaLockout.Load() {
 		return "", "", nil, fmt.Errorf("CAPTCHA_WAIT_REQUIRED: global lockout active")
@@ -1032,7 +1101,7 @@ func fetchVkCreds(ctx context.Context, link string, streamID int, dialer *dnsdia
 	for _, creds := range vkCredentialsList {
 		log.Printf("[STREAM %d] [VK Auth] Trying credentials: client_id=%s", streamID, creds.ClientID)
 
-		user, pass, addrs, err := getTokenChain(ctx, link, streamID, creds, dialer, jar)
+		user, pass, addrs, err := getTokenChain(ctx, link, streamID, creds, jar)
 
 		if err == nil {
 			log.Printf("[STREAM %d] [VK Auth] Success with client_id=%s", streamID, creds.ClientID)
@@ -1055,7 +1124,7 @@ func fetchVkCreds(ctx context.Context, link string, streamID int, dialer *dnsdia
 	return "", "", nil, fmt.Errorf("all VK credentials failed: %w", lastErr)
 }
 
-func getTokenChain(ctx context.Context, link string, streamID int, creds VKCredentials, dialer *dnsdialer.Dialer, jar tlsclient.CookieJar) (string, string, []string, error) {
+func getTokenChain(ctx context.Context, link string, streamID int, creds VKCredentials, jar tlsclient.CookieJar) (string, string, []string, error) {
 	profile := Profile{
 		UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
 		SecChUa:         `"Not(A:Brand";v="99", "Google Chrome";v="146", "Chromium";v="146"`,
@@ -1206,6 +1275,15 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 					// Use context.Background() so that a short deadline on the parent ctx
 					// (e.g. the overall auth timeout) doesn't cut the user's solve time short.
 					manualCtx, manualCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+					if globalAppContext != nil {
+						go func() {
+							select {
+							case <-manualCtx.Done():
+							case <-globalAppContext.Done():
+								manualCancel()
+							}
+						}()
+					}
 
 					type manualRes struct {
 						token string
@@ -1218,9 +1296,9 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 						var t, k string
 						var e error
 						if captchaErr.RedirectURI != "" {
-							t, e = solveCaptchaViaProxy(captchaErr.RedirectURI, dialer)
+							t, e = solveCaptchaViaProxy(manualCtx, captchaErr.RedirectURI)
 						} else if captchaErr.CaptchaImg != "" {
-							k, e = solveCaptchaViaHTTP(captchaErr.CaptchaImg)
+							k, e = solveCaptchaViaHTTP(manualCtx, captchaErr.CaptchaImg)
 						} else {
 							e = fmt.Errorf("no redirect_uri or captcha_img")
 						}
@@ -1542,7 +1620,10 @@ func getYandexCreds(link string) (string, string, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	dialer := websocket.Dialer{}
+	protectedDialer := getCustomNetDialer()
+	dialer := websocket.Dialer{
+		NetDialContext: protectedDialer.DialContext,
+	}
 	var conn *websocket.Conn
 	conn, resp, err = dialer.DialContext(ctx, data.Wss, h)
 	if err != nil {
@@ -1841,11 +1922,10 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	debugf("[STREAM %d] TURN server IP: %s", streamID, turnServerUDPAddr.IP)
 	var cfg *turn.ClientConfig
 	var turnConn net.PacketConn
-	var d net.Dialer
 	ctx1, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if turnParams.udp {
-		conn, err2 := net.DialUDP("udp", nil, turnServerUDPAddr) // nolint: noctx
+		conn, err2 := protectedDialUDP(ctx1, "udp", nil, turnServerUDPAddr)
 		if err2 != nil {
 			err = fmt.Errorf("failed to connect to TURN server: %s", err2)
 			return
@@ -1858,6 +1938,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		}()
 		turnConn = &connectedUDPConn{conn}
 	} else {
+		d := newProtectedDialer()
 		conn, err2 := d.DialContext(ctx1, "tcp", turnServerAddr)
 		if err2 != nil {
 			err = fmt.Errorf("failed to connect to TURN server: %s", err2)
@@ -2109,10 +2190,7 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 }
 
 func setupGlobalResolver() {
-	dialer := &net.Dialer{
-		Timeout:   10 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
+	dialer := newProtectedDialer()
 	dnsServers := []string{"77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"}
 
 	net.DefaultResolver = &net.Resolver{
@@ -2164,12 +2242,17 @@ func (cfg *Config) setDefaults() {
 	}
 }
 
-func Run(ctx context.Context, cfg Config) error {
+func RunWithConfig(ctx context.Context, cfg Config) error {
 	setupGlobalResolver()
 	cfg.setDefaults()
 	ctx, cancel := context.WithCancel(ctx)
+	globalAppContext = ctx
 	globalAppCancel = cancel
-	defer cancel()
+	defer func() {
+		globalAppContext = nil
+		globalAppCancel = nil
+		cancel()
+	}()
 
 	if cfg.PeerAddr == "" {
 		return fmt.Errorf("need peer address")
@@ -2213,14 +2296,8 @@ func Run(ctx context.Context, cfg Config) error {
 		parts := strings.Split(cfg.VKLink, "join/")
 		link = parts[len(parts)-1]
 
-		dialer := dnsdialer.New(
-			dnsdialer.WithResolvers("77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"),
-			dnsdialer.WithStrategy(dnsdialer.Fallback{}),
-			dnsdialer.WithCache(100, 10*time.Hour, 10*time.Hour),
-		)
-
 		getCreds = func(ctx context.Context, s string, streamID int) (string, string, string, error) {
-			return getVkCredsCached(ctx, s, streamID, dialer)
+			return getVkCredsCached(ctx, s, streamID)
 		}
 		if cfg.NumStreams <= 0 {
 			cfg.NumStreams = 10
@@ -2968,14 +3045,14 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, i
 	ctx1, cancel1 := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel1()
 	if tp.udp {
-		c, err1 := net.DialUDP("udp", nil, turnServerUDPAddr)
+		c, err1 := protectedDialUDP(ctx1, "udp", nil, turnServerUDPAddr)
 		if err1 != nil {
 			return nil, nil, &turnSetupError{addr: turnServerAddr, err: fmt.Errorf("dial TURN (udp): %w", err1)}
 		}
 		cleanupFns = append(cleanupFns, func() { _ = c.Close() })
 		turnConn = &connectedUDPConn{c}
 	} else {
-		var d net.Dialer
+		d := newProtectedDialer()
 		c, err1 := d.DialContext(ctx1, "tcp", turnServerAddr)
 		if err1 != nil {
 			return nil, nil, &turnSetupError{addr: turnServerAddr, err: fmt.Errorf("dial TURN (tcp): %w", err1)}
