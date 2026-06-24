@@ -148,6 +148,10 @@ func genWrapKeyHex() (string, error) {
 	return hex.EncodeToString(key), nil
 }
 
+func GenWrapKeyHex() (string, error) {
+	return genWrapKeyHex()
+}
+
 func decodeWrapKey(enabled bool, raw string) ([]byte, error) {
 	if !enabled {
 		return nil, nil
