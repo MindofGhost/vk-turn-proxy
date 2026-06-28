@@ -504,47 +504,66 @@ type VkCaptchaError struct {
 	CaptchaAttempt          string
 }
 
+func parseVKErrorCode(value interface{}) (int, bool) {
+	switch v := value.(type) {
+	case float64:
+		return int(v), true
+	case int:
+		return v, true
+	case json.Number:
+		n, err := v.Int64()
+		return int(n), err == nil
+	case string:
+		n, err := strconv.Atoi(v)
+		return n, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func parseVKString(value interface{}) (string, bool) {
+	switch v := value.(type) {
+	case string:
+		return v, v != ""
+	case float64:
+		return fmt.Sprintf("%.0f", v), true
+	case int:
+		return strconv.Itoa(v), true
+	case json.Number:
+		return v.String(), v.String() != ""
+	default:
+		return "", false
+	}
+}
+
 func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 	// Extract error_code
-	codeFloat, ok := errData["error_code"].(float64)
+	code, ok := parseVKErrorCode(errData["error_code"])
 	if !ok {
 		log.Printf("missing error_code in captcha error data")
 		return nil
 	}
-	code := int(codeFloat)
-
-	// Extract redirect_uri
-	RedirectURI, ok := errData["redirect_uri"].(string)
-	if !ok {
-		log.Printf("missing redirect_uri in captcha error data")
-		return nil
-	}
 
 	// Extract captcha_sid
-	captchaSid, ok := errData["captcha_sid"].(string)
-	if !ok {
-		// try numeric
-		if sidNum, ok2 := errData["captcha_sid"].(float64); ok2 {
-			captchaSid = fmt.Sprintf("%.0f", sidNum)
-		} else {
-			log.Printf("missing captcha_sid in captcha error data")
-			return nil
-		}
+	captchaSid, _ := parseVKString(errData["captcha_sid"])
+	if captchaSid == "" {
+		log.Printf("captcha_sid not present in captcha error data")
 	}
 
 	// Extract captcha_img
-	captchaImg, ok := errData["captcha_img"].(string)
-	if !ok {
-		log.Printf("missing captcha_img in captcha error data")
-		return nil
+	captchaImg, _ := parseVKString(errData["captcha_img"])
+	if captchaImg == "" {
+		log.Printf("captcha_img not present in captcha error data")
 	}
 
 	// Extract error_msg
-	errorMsg, ok := errData["error_msg"].(string)
-	if !ok {
-		log.Printf("missing error_msg in captcha error data")
-		return nil
+	errorMsg, _ := parseVKString(errData["error_msg"])
+	if errorMsg == "" {
+		log.Printf("error_msg not present in captcha error data")
 	}
+
+	// Extract redirect_uri
+	RedirectURI, _ := parseVKString(errData["redirect_uri"])
 
 	// Extract session token
 	var sessionToken string
@@ -561,6 +580,14 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 		if st, stOk := errData["session_token"].(string); stOk {
 			sessionToken = st
 		}
+	}
+	if RedirectURI == "" && captchaImg == "" {
+		log.Printf("missing redirect_uri and captcha_img in captcha error data")
+		return nil
+	}
+	if RedirectURI != "" && sessionToken == "" {
+		log.Printf("missing session_token in captcha redirect_uri")
+		return nil
 	}
 
 	// Extract is_sound_captcha_available
@@ -600,7 +627,7 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 }
 
 func (e *VkCaptchaError) IsCaptchaError() bool {
-	return e.ErrorCode == 14 && e.RedirectURI != "" && e.SessionToken != ""
+	return e.ErrorCode == 14 && ((e.RedirectURI != "" && e.SessionToken != "") || e.CaptchaImg != "")
 }
 
 func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID int, client tlsclient.HttpClient, profile Profile, useSliderPOC bool) (string, error) {
