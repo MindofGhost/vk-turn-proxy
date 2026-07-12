@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"math/rand"
 	"os"
+	"path/filepath"
+
+	"cfa/native/app"
 )
 
 type Profile struct {
@@ -21,8 +24,17 @@ type SavedProfile struct {
 
 const profileFile = "vk_profile.json"
 
+func profilePath() string {
+	cacheDir := app.CacheDir()
+	if cacheDir == "" {
+		return profileFile
+	}
+
+	return filepath.Join(cacheDir, "vkturn", profileFile)
+}
+
 func LoadProfileFromDisk() (*SavedProfile, error) {
-	data, err := os.ReadFile(profileFile)
+	data, err := os.ReadFile(profilePath())
 	if err != nil {
 		return nil, err
 	}
@@ -38,7 +50,12 @@ func SaveProfileToDisk(sp SavedProfile) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(profileFile, data, 0644)
+	path := profilePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+
+	return os.WriteFile(path, data, 0600)
 }
 
 // profiles contain paired User-Agent and Client Hints strings to harden bot detection.
