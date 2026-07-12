@@ -39,6 +39,8 @@ func main() {
 	wrapMode := flag.Bool("wrap", false, "WRAP mode: SRTP-like AEAD obfuscation for DTLS packets before they reach TURN ChannelData")
 	wrapKeyHex := flag.String("wrap-key", "", "32-byte hex-encoded shared key for -wrap (64 hex chars)")
 	genWrapKey := flag.Bool("gen-wrap-key", false, "print a fresh 64-character hex key for -wrap-key and exit")
+	healthcheck := flag.String("healthcheck", "", "probe a local server address and exit")
+	healthcheckTimeout := flag.Duration("healthcheck-timeout", 5*time.Second, "DTLS healthcheck timeout")
 	debugFlag := flag.Bool("debug", false, "enable debug logging")
 	flag.Parse()
 	isDebug = *debugFlag
@@ -49,6 +51,22 @@ func main() {
 			log.Panicf("gen-wrap-key: rand.Read: %v", err)
 		}
 		fmt.Println(hex.EncodeToString(key))
+		return
+	}
+
+	if *healthcheck != "" {
+		var key []byte
+		var err error
+		if *wrapMode {
+			key, err = hex.DecodeString(*wrapKeyHex)
+			if err != nil || len(key) != wrapKeyLen {
+				log.Fatalf("healthcheck: -wrap requires a valid 64-character -wrap-key")
+			}
+		}
+		if err = probeServer(*healthcheck, *healthcheckTimeout, key); err != nil {
+			log.Fatalf("UNHEALTHY: %v", err)
+		}
+		log.Printf("HEALTHY: DTLS handshake with %s completed", *healthcheck)
 		return
 	}
 
