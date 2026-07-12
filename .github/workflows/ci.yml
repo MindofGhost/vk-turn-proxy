@@ -5,9 +5,9 @@ permissions:
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main-dev" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main-dev" ]
 
 jobs:
   check:
@@ -55,7 +55,7 @@ jobs:
       - name: Run tests
         run: |
           go test ./... -v
-          
+
   build:
     name: Build binaries
     runs-on: ubuntu-latest
@@ -140,7 +140,7 @@ jobs:
           go build -ldflags "-s -w -checklinkname=0" -trimpath \
             -o "dist/client-${GOOS}-${GOARCH}${ext}" \
             ./client
-          
+
           GOOS=$GOOS GOARCH=$GOARCH \
           go build -ldflags "-s -w -checklinkname=0" -trimpath \
             -o "dist/server-${GOOS}-${GOARCH}${ext}" \

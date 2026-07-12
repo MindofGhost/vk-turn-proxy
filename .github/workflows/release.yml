@@ -6,7 +6,7 @@ permissions:
 on:
   push:
     branches:
-      - main
+      - main-dev
   workflow_dispatch:
 
 jobs:
@@ -74,6 +74,8 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v6
+        with:
+          ref: main-dev
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -160,6 +162,7 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v6
         with:
+          ref: main-dev
           fetch-depth: 0
           fetch-tags: true
 
@@ -171,7 +174,7 @@ jobs:
       - name: Prepare release metadata
         id: meta
         run: |
-          LATEST_TAG="$(git tag -l | grep -E '^(v)?[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
+          LATEST_TAG="$(git tag --merged HEAD -l | grep -E '^(v)?[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
           PREFIX=""
           BASE_VERSION="$LATEST_TAG"
 
@@ -272,7 +275,7 @@ jobs:
           files: |
             dist/**
           tag_name: ${{ steps.meta.outputs.tag_name }}
-          target_commitish: ${{ github.sha }}
+          target_commitish: main-dev
           name: ${{ steps.meta.outputs.release_name }}
           body_path: ${{ steps.meta.outputs.body_path }}
           overwrite_files: true
@@ -296,6 +299,8 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v6
+        with:
+          ref: main-dev
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
