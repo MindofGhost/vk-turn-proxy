@@ -291,7 +291,7 @@ jobs:
   docker:
     name: Publish Docker image
     needs: release
-    if: needs.release.outputs.should_release == 'true'
+    if: needs.release.outputs.should_release == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
