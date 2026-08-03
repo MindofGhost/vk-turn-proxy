@@ -670,26 +670,47 @@ func (c *fallbackDNSConn) attemptDeadline(outer time.Time) time.Time {
 }
 
 func newProtectedResolver() *net.Resolver {
-	var nextServer atomic.Uint64
-
 	return &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			d := newProtectedSocketDialer()
-			start := int(nextServer.Add(1)-1) % len(fallbackDNSServers)
-			servers := make([]string, len(fallbackDNSServers))
-			for offset := range servers {
-				servers[offset] = fallbackDNSServers[(start+offset)%len(fallbackDNSServers)]
-			}
 
 			return &fallbackDNSConn{
 				ctx:     ctx,
 				network: "tcp",
 				dialer:  d,
-				servers: servers,
+				servers: availableDNSServers(),
 			}, nil
 		},
 	}
+}
+
+func availableDNSServers() []string {
+	systemServers := app.SystemDNS()
+	candidates := make([]string, 0, len(fallbackDNSServers)+len(systemServers))
+	candidates = append(candidates, fallbackDNSServers...)
+	candidates = append(candidates, systemServers...)
+
+	servers := make([]string, 0, len(candidates))
+	seen := make(map[string]struct{})
+
+	for _, server := range candidates {
+		server = strings.TrimSpace(server)
+		if server == "" {
+			continue
+		}
+		if _, _, err := net.SplitHostPort(server); err != nil {
+			server = net.JoinHostPort(strings.Trim(server, "[]"), "53")
+		}
+		if _, exists := seen[server]; exists {
+			continue
+		}
+
+		seen[server] = struct{}{}
+		servers = append(servers, server)
+	}
+
+	return servers
 }
 
 // ResolveHost resolves infrastructure hosts through protected sockets, independently
