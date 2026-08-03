@@ -257,12 +257,19 @@ func protectDialer(dialer *net.Dialer) {
 	}
 }
 
-func newProtectedDialer() net.Dialer {
+func newProtectedSocketDialer() net.Dialer {
 	dialer := net.Dialer{
 		Timeout:   20 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
 	protectDialer(&dialer)
+
+	return dialer
+}
+
+func newProtectedDialer() net.Dialer {
+	dialer := newProtectedSocketDialer()
+	dialer.Resolver = newProtectedResolver()
 
 	return dialer
 }
@@ -469,14 +476,9 @@ func generateCheckboxCursor() string {
 var fallbackDNSServers = []string{
 	"77.88.8.8:53",
 	"195.208.4.1:53",
-	"77.88.8.1:53",
-	"8.8.8.8:53",
-	"8.8.4.4:53",
-	"1.1.1.1:53",
-	"1.0.0.1:53",
 }
 
-const fallbackDNSAttemptTimeout = 2 * time.Second
+const fallbackDNSAttemptTimeout = 3 * time.Second
 
 type fallbackDNSConn struct {
 	ctx           context.Context
@@ -673,7 +675,7 @@ func newProtectedResolver() *net.Resolver {
 	return &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := newProtectedDialer()
+			d := newProtectedSocketDialer()
 			start := int(nextServer.Add(1)-1) % len(fallbackDNSServers)
 			servers := make([]string, len(fallbackDNSServers))
 			for offset := range servers {
@@ -703,10 +705,7 @@ func ResolveHost(ctx context.Context, host string) ([]string, error) {
 }
 
 func getCustomNetDialer() net.Dialer {
-	dialer := newProtectedDialer()
-	dialer.Resolver = newProtectedResolver()
-
-	return dialer
+	return newProtectedDialer()
 }
 
 // endregion
@@ -2441,10 +2440,6 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 	}
 }
 
-func setupGlobalResolver() {
-	net.DefaultResolver = newProtectedResolver()
-}
-
 type Config struct {
 	TURNHost       string `json:"turn_host,omitempty"`
 	TURNPort       string `json:"turn_port,omitempty"`
@@ -2479,7 +2474,6 @@ func (cfg *Config) setDefaults() {
 }
 
 func Run(ctx context.Context, cfg Config) error {
-	setupGlobalResolver()
 	cfg.setDefaults()
 	ctx, cancel := context.WithCancel(ctx)
 	globalAppContext = ctx
