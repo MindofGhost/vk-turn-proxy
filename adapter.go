@@ -53,3 +53,7 @@ func Run(ctx context.Context, args []string) error {
 
 	return clientcore.Run(ctx, cfg)
 }
+
+func ResolveHost(ctx context.Context, host string) ([]string, error) {
+	return clientcore.ResolveHost(ctx, host)
+}

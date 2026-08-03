@@ -466,15 +466,27 @@ func generateCheckboxCursor() string {
 }
 */
 
-func getCustomNetDialer() net.Dialer {
-	dialer := newProtectedDialer()
-	dialer.Resolver = &net.Resolver{
+var fallbackDNSServers = []string{
+	"77.88.8.8:53",
+	"195.208.4.1:53",
+	"77.88.8.1:53",
+	"8.8.8.8:53",
+	"8.8.4.4:53",
+	"1.1.1.1:53",
+	"1.0.0.1:53",
+}
+
+func newProtectedResolver() *net.Resolver {
+	var nextServer atomic.Uint64
+
+	return &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			d := newProtectedDialer()
-			dnsServers := []string{"77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"}
+			start := int(nextServer.Add(1)-1) % len(fallbackDNSServers)
 			var lastErr error
-			for _, dns := range dnsServers {
+			for offset := range fallbackDNSServers {
+				dns := fallbackDNSServers[(start+offset)%len(fallbackDNSServers)]
 				conn, err := d.DialContext(ctx, "udp", dns)
 				if err == nil {
 					return conn, nil
@@ -484,6 +496,17 @@ func getCustomNetDialer() net.Dialer {
 			return nil, lastErr
 		},
 	}
+}
+
+// ResolveHost resolves infrastructure hosts through protected sockets, independently
+// from Android's system DNS and the VPN tunnel.
+func ResolveHost(ctx context.Context, host string) ([]string, error) {
+	return newProtectedResolver().LookupHost(ctx, host)
+}
+
+func getCustomNetDialer() net.Dialer {
+	dialer := newProtectedDialer()
+	dialer.Resolver = newProtectedResolver()
 
 	return dialer
 }
@@ -2221,23 +2244,7 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 }
 
 func setupGlobalResolver() {
-	dialer := newProtectedDialer()
-	dnsServers := []string{"77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"}
-
-	net.DefaultResolver = &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			var lastErr error
-			for _, dns := range dnsServers {
-				conn, err := dialer.DialContext(ctx, "udp", dns)
-				if err == nil {
-					return conn, nil
-				}
-				lastErr = err
-			}
-			return nil, lastErr
-		},
-	}
+	net.DefaultResolver = newProtectedResolver()
 }
 
 type Config struct {
