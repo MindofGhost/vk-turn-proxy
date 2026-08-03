@@ -476,6 +476,197 @@ var fallbackDNSServers = []string{
 	"1.0.0.1:53",
 }
 
+const fallbackDNSAttemptTimeout = 2 * time.Second
+
+type fallbackDNSConn struct {
+	ctx           context.Context
+	network       string
+	dialer        net.Dialer
+	servers       []string
+	nextServer    int
+	conn          net.Conn
+	currentServer string
+	query         []byte
+	readDeadline  time.Time
+	writeDeadline time.Time
+	closed        bool
+	mu            sync.Mutex
+}
+
+func (c *fallbackDNSConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return 0, net.ErrClosed
+	}
+	if c.conn == nil {
+		return 0, errors.New("DNS query was not written")
+	}
+
+	for {
+		c.applyReadDeadlineLocked()
+		n, err := c.conn.Read(p)
+		if err == nil {
+			log.Printf("[DNS Resolver] response received via %s", c.currentServer)
+			return n, nil
+		}
+
+		failedServer := c.currentServer
+		_ = c.conn.Close()
+		c.conn = nil
+		c.currentServer = ""
+		log.Printf("[DNS Resolver] %s failed: %v", failedServer, err)
+
+		if len(c.query) == 0 {
+			return n, err
+		}
+		if writeErr := c.connectAndWriteLocked(c.query); writeErr != nil {
+			return 0, fmt.Errorf("DNS fallback after %s failed: %w", failedServer, writeErr)
+		}
+	}
+}
+
+func (c *fallbackDNSConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return 0, net.ErrClosed
+	}
+
+	c.query = append(c.query[:0], p...)
+	if c.conn != nil {
+		_ = c.conn.Close()
+		c.conn = nil
+		c.currentServer = ""
+	}
+
+	if err := c.connectAndWriteLocked(c.query); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (c *fallbackDNSConn) connectAndWriteLocked(query []byte) error {
+	var lastErr error
+
+	for c.nextServer < len(c.servers) {
+		server := c.servers[c.nextServer]
+		c.nextServer++
+
+		conn, err := c.dialer.DialContext(c.ctx, c.network, server)
+		if err != nil {
+			lastErr = err
+			log.Printf("[DNS Resolver] cannot connect to %s: %v", server, err)
+			continue
+		}
+
+		c.conn = conn
+		c.currentServer = server
+		c.applyWriteDeadlineLocked()
+		if _, err = conn.Write(query); err == nil {
+			return nil
+		}
+
+		lastErr = err
+		log.Printf("[DNS Resolver] cannot query %s: %v", server, err)
+		_ = conn.Close()
+		c.conn = nil
+		c.currentServer = ""
+	}
+
+	if lastErr == nil {
+		lastErr = errors.New("no DNS servers left")
+	}
+	return lastErr
+}
+
+func (c *fallbackDNSConn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.closed = true
+	if c.conn != nil {
+		return c.conn.Close()
+	}
+	return nil
+}
+
+func (c *fallbackDNSConn) LocalAddr() net.Addr {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.conn != nil {
+		return c.conn.LocalAddr()
+	}
+	return &net.UDPAddr{}
+}
+
+func (c *fallbackDNSConn) RemoteAddr() net.Addr {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.conn != nil {
+		return c.conn.RemoteAddr()
+	}
+	return &net.UDPAddr{}
+}
+
+func (c *fallbackDNSConn) SetDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.readDeadline = deadline
+	c.writeDeadline = deadline
+	if c.conn != nil {
+		c.applyReadDeadlineLocked()
+		c.applyWriteDeadlineLocked()
+	}
+	return nil
+}
+
+func (c *fallbackDNSConn) SetReadDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.readDeadline = deadline
+	if c.conn != nil {
+		c.applyReadDeadlineLocked()
+	}
+	return nil
+}
+
+func (c *fallbackDNSConn) SetWriteDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.writeDeadline = deadline
+	if c.conn != nil {
+		c.applyWriteDeadlineLocked()
+	}
+	return nil
+}
+
+func (c *fallbackDNSConn) applyReadDeadlineLocked() {
+	_ = c.conn.SetReadDeadline(c.attemptDeadline(c.readDeadline))
+}
+
+func (c *fallbackDNSConn) applyWriteDeadlineLocked() {
+	_ = c.conn.SetWriteDeadline(c.attemptDeadline(c.writeDeadline))
+}
+
+func (c *fallbackDNSConn) attemptDeadline(outer time.Time) time.Time {
+	deadline := time.Now().Add(fallbackDNSAttemptTimeout)
+	if ctxDeadline, ok := c.ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	if !outer.IsZero() && outer.Before(deadline) {
+		deadline = outer
+	}
+	return deadline
+}
+
 func newProtectedResolver() *net.Resolver {
 	var nextServer atomic.Uint64
 
@@ -484,16 +675,23 @@ func newProtectedResolver() *net.Resolver {
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			d := newProtectedDialer()
 			start := int(nextServer.Add(1)-1) % len(fallbackDNSServers)
-			var lastErr error
-			for offset := range fallbackDNSServers {
-				dns := fallbackDNSServers[(start+offset)%len(fallbackDNSServers)]
-				conn, err := d.DialContext(ctx, "udp", dns)
-				if err == nil {
-					return conn, nil
-				}
-				lastErr = err
+			servers := make([]string, len(fallbackDNSServers))
+			for offset := range servers {
+				servers[offset] = fallbackDNSServers[(start+offset)%len(fallbackDNSServers)]
 			}
-			return nil, lastErr
+
+			if strings.HasPrefix(network, "tcp") {
+				network = "tcp"
+			} else {
+				network = "udp"
+			}
+
+			return &fallbackDNSConn{
+				ctx:     ctx,
+				network: network,
+				dialer:  d,
+				servers: servers,
+			}, nil
 		},
 	}
 }
