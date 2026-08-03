@@ -682,15 +682,9 @@ func newProtectedResolver() *net.Resolver {
 				servers[offset] = fallbackDNSServers[(start+offset)%len(fallbackDNSServers)]
 			}
 
-			if strings.HasPrefix(network, "tcp") {
-				network = "tcp"
-			} else {
-				network = "udp"
-			}
-
 			return &fallbackDNSConn{
 				ctx:     ctx,
-				network: network,
+				network: "tcp",
 				dialer:  d,
 				servers: servers,
 			}, nil
